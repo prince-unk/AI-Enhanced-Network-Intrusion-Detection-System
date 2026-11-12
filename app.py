@@ -17,6 +17,13 @@ from storage import NIDSStorage
 # Shared local database for dashboard persistence.
 nids_db = NIDSStorage()
 
+if not st.session_state.get("nids_retention_applied", False):
+    try:
+        nids_db.apply_retention(routine_event_cap=20000)
+        st.session_state["nids_retention_applied"] = True
+    except Exception as exc:
+        st.warning(f"Database retention cleanup could not run: {exc}")
+
 def read_new_eve_events(path, buffer_limit=500, alert_limit=200):
     """Read only newly appended Suricata EVE records."""
 
@@ -121,9 +128,18 @@ def read_new_eve_events(path, buffer_limit=500, alert_limit=200):
         if event.get("event_type") == "alert" or event.get("alert")
     ])
 
-    # Maintain rolling network-event history.
-    state.live_events.extend(new_events)
-    state.live_events = state.live_events[-buffer_limit:]
+    # Display history is loaded from SQLite on every rerun. This is important:
+    # changing the slider from 500 to (for example) 1700 must fetch older saved
+    # rows, not merely enlarge the in-memory buffer that currently holds 500.
+    # Ingestion remains incremental above; this query does not reread the EVE file
+    # and does not create duplicate database records.
+    try:
+        state.live_events = nids_db.get_events(limit=buffer_limit)
+    except Exception as exc:
+        # Keep the dashboard usable if SQLite is temporarily unavailable.
+        state.live_events.extend(new_events)
+        state.live_events = state.live_events[-buffer_limit:]
+        st.warning(f"Could not reload event history from SQLite: {exc}")
 
     # Maintain a separate alert history.
     new_alerts = [
@@ -177,7 +193,11 @@ with st.sidebar:
     )
 
     max_events = st.slider(
-        "Maximum events to read", 100, 10000, 2000, 100
+        "Recent events to display",
+        min_value=100,
+        max_value=10000,
+        value=500,
+        step=100
     )
 
     refresh = st.checkbox(
@@ -222,7 +242,7 @@ elif mode == "Upload EVE JSON":
 else:
     events, live_alerts = read_new_eve_events(
         eve_path,
-        buffer_limit=500,
+        buffer_limit=max_events,
         alert_limit=200
     )
     source = f"{eve_path} — incremental live monitoring"
@@ -251,6 +271,13 @@ if mode == "Live Suricata EVE":
         st.session_state.behavior_detector
         .detect_port_scans(events)
     )
+
+    # Keep behavioural detections separately from 60-day incident records.
+    for detection in new_behavior_alerts:
+        try:
+            nids_db.save_behavioral_detection(detection)
+        except Exception as exc:
+            st.warning(f"Behavioural detection persistence unavailable: {exc}")
 
     # Retain detected behavioural incidents.
     st.session_state.behavior_alerts.extend(
@@ -391,7 +418,7 @@ if events:
 
     activity_rows = []
 
-    for event in reversed(events[-100:]):
+    for event in reversed(events[-max_events:]):
         alert = event.get("alert") or {}
 
         activity_rows.append({

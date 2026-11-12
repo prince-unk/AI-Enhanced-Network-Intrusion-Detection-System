@@ -45,6 +45,14 @@ class NIDSStorage:
             CREATE TABLE IF NOT EXISTS ai_cache(
               cache_key TEXT PRIMARY KEY,provider TEXT,model TEXT,result_json TEXT NOT NULL,
               created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+            CREATE TABLE IF NOT EXISTS alert_history(
+              alert_id TEXT PRIMARY KEY, raw_json TEXT NOT NULL,
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+            CREATE INDEX IF NOT EXISTS idx_alert_history_created ON alert_history(created_at);
+            CREATE TABLE IF NOT EXISTS behavioral_detections(
+              detection_id TEXT PRIMARY KEY, detection_json TEXT NOT NULL,
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+            CREATE INDEX IF NOT EXISTS idx_behavior_created ON behavioral_detections(created_at);
             CREATE TABLE IF NOT EXISTS analyst_notes(
               note_id INTEGER PRIMARY KEY AUTOINCREMENT,incident_id TEXT,note TEXT,
               created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -66,11 +74,15 @@ class NIDSStorage:
     def save_event(self,event):
         a=event.get("alert") or {}
         with self.connect() as c:
+            event_id = self.fp(event)
             cur=c.execute("""INSERT OR IGNORE INTO events
               (event_id,event_type,timestamp,src_ip,dest_ip,signature,raw_json)
               VALUES(?,?,?,?,?,?,?)""",
-              (self.fp(event),event.get("event_type","unknown"),event.get("timestamp"),
+              (event_id,event.get("event_type","unknown"),event.get("timestamp"),
                event.get("src_ip"),event.get("dest_ip"),a.get("signature"),self.js(event)))
+            if event.get("event_type") == "alert" or event.get("alert"):
+                c.execute("INSERT OR IGNORE INTO alert_history(alert_id,raw_json) VALUES(?,?)",
+                          (event_id,self.js(event)))
             return cur.rowcount==1
 
     def save_events(self,events): return sum(self.save_event(e) for e in events)
@@ -178,6 +190,51 @@ class NIDSStorage:
                          updated_at=CURRENT_TIMESTAMP""", (day,))
             c.execute("INSERT INTO ai_request_log(requested_at) VALUES(?)", (now_iso,))
             return True, "allowed", daily_count + 1
+
+    def save_behavioral_detection(self, detection):
+        key = self.fp(detection)
+        with self.connect() as c:
+            c.execute("INSERT OR IGNORE INTO behavioral_detections(detection_id,detection_json) VALUES(?,?)",
+                      (key, self.js(detection)))
+        return key
+
+    def apply_retention(self, routine_event_cap=20000):
+        """Routine events: 7 days and 20k cap; alerts/behaviour: 30 days;
+        incidents/evidence/notes/audit: 60 days."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        cut7 = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        cut30 = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        cut60 = (now - timedelta(days=60)).strftime("%Y-%m-%d %H:%M:%S")
+        deleted = {}
+        with self.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            cur=c.execute("DELETE FROM events WHERE lower(coalesce(event_type,'')) != 'alert' AND created_at < ?",(cut7,))
+            deleted["routine_events_age"]=cur.rowcount
+            cur=c.execute("""DELETE FROM events WHERE event_id IN (
+                SELECT event_id FROM events WHERE lower(coalesce(event_type,'')) != 'alert'
+                ORDER BY rowid DESC LIMIT -1 OFFSET ?)""",(int(routine_event_cap),))
+            deleted["routine_events_cap"]=cur.rowcount
+            cur=c.execute("DELETE FROM alert_history WHERE created_at < ?",(cut30,))
+            deleted["alerts"]=cur.rowcount
+            cur = c.execute(
+                """
+                DELETE FROM events
+                WHERE lower(coalesce(event_type, '')) = 'alert'
+                AND created_at < ?
+                """,
+                (cut30,)
+            )
+            deleted["alert_events"] = cur.rowcount
+            cur=c.execute("DELETE FROM behavioral_detections WHERE created_at < ?",(cut30,))
+            deleted["behavioral_detections"]=cur.rowcount
+            cur=c.execute("DELETE FROM incidents WHERE updated_at < ?",(cut60,))
+            deleted["incidents"]=cur.rowcount
+            cur=c.execute("DELETE FROM analyst_notes WHERE created_at < ?",(cut60,))
+            deleted["analyst_notes"]=cur.rowcount
+            cur=c.execute("DELETE FROM audit_log WHERE created_at < ?",(cut60,))
+            deleted["audit_logs"]=cur.rowcount
+        return deleted
 
     def backup(self,destination=None):
         target=Path(destination) if destination else self.db_path.with_suffix(".backup.db")

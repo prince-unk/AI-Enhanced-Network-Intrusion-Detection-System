@@ -174,7 +174,7 @@ def enrich_alert(event, cache=None):
     if triage is None:
         try:
             allowed, reason, daily_count = _NIDS_STORAGE.reserve_ai_request(
-                daily_limit=400, per_minute_limit=10
+                daily_limit=498, per_minute_limit=14
             ) if _NIDS_STORAGE is not None else (False, "database_unavailable", 0)
         except Exception:
             allowed = False
