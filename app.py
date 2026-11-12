@@ -12,6 +12,10 @@ from streamlit_autorefresh import st_autorefresh
 from nids_core import load_events, enrich_alert
 
 from behavior_engine import BehavioralDetector
+from storage import NIDSStorage
+
+# Shared local database for dashboard persistence.
+nids_db = NIDSStorage()
 
 def read_new_eve_events(path, buffer_limit=500, alert_limit=200):
     """Read only newly appended Suricata EVE records."""
@@ -31,11 +35,22 @@ def read_new_eve_events(path, buffer_limit=500, alert_limit=200):
         state.eve_offset = stat.st_size
         state.eve_inode = inode
         state.eve_pending = ""
-        state.live_events = []
-        state.live_alerts = []
+        # Restore recent saved records, but keep the EVE cursor at EOF so
+        # historical log entries are not replayed as new traffic.
+        restored_events = nids_db.get_events(limit=buffer_limit)
+        state.live_events = restored_events
+        state.live_alerts = [
+            event for event in restored_events
+            if event.get("event_type") == "alert" or event.get("alert")
+        ][-alert_limit:]
         state.event_totals = {}
-        state.session_alert_total = 0
-        state.last_event_timestamp = None
+        for restored in restored_events:
+            event_type = str(restored.get("event_type", "unknown")).lower()
+            state.event_totals[event_type] = state.event_totals.get(event_type, 0) + 1
+        state.session_alert_total = len(state.live_alerts)
+        state.last_event_timestamp = (
+            restored_events[-1].get("timestamp") if restored_events else None
+        )
         state.last_event_received = None
 
     # Detect file rotation or truncation.
@@ -77,7 +92,14 @@ def read_new_eve_events(path, buffer_limit=500, alert_limit=200):
         return state.live_events, state.live_alerts
 
 
-# Update cumulative session statistics.
+# Persist only newly appended EVE records; save_events deduplicates them.
+    if new_events:
+        try:
+            nids_db.save_events(new_events)
+        except Exception as exc:
+            st.warning(f"SQLite event persistence unavailable: {exc}")
+
+    # Update cumulative session statistics.
     for event in new_events:
         event_type = str(
             event.get("event_type", "unknown")
@@ -606,7 +628,16 @@ def upsert_incident(kind, severity, source_ip, destination_ip,
                     signature, timestamp, description, evidence,
                     recommended_action):
     """Create or update a deduplicated incident in this dashboard session."""
-    incidents = st.session_state.setdefault("nids_incidents", {})
+    if "nids_incidents" not in st.session_state:
+        restored_incidents = nids_db.get_incidents()
+        st.session_state["nids_incidents"] = {
+            incident_fingerprint(
+                record.get("detection_type"), record.get("source_ip"),
+                record.get("destination_ip"), record.get("signature")
+            ): record
+            for record in restored_incidents
+        }
+    incidents = st.session_state["nids_incidents"]
     fingerprint = incident_fingerprint(
         kind, source_ip, destination_ip, signature
     )
@@ -648,6 +679,13 @@ def upsert_incident(kind, severity, source_ip, destination_ip,
     if evidence and evidence not in incident["evidence"]:
         incident["evidence"].append(evidence)
         incident["evidence"] = incident["evidence"][-20:]
+
+    # Persist incident and evidence on every upsert.
+    incident["fingerprint"] = fingerprint
+    try:
+        nids_db.save_incident(incident)
+    except Exception as exc:
+        st.warning(f"SQLite incident persistence unavailable: {exc}")
 
 
 # Convert behavioural detections into incidents.
@@ -692,7 +730,16 @@ for item in items:
 st.divider()
 st.header("🗂️ Incident Management")
 
-incident_store = st.session_state.setdefault("nids_incidents", {})
+if "nids_incidents" not in st.session_state:
+    restored_incidents = nids_db.get_incidents()
+    st.session_state["nids_incidents"] = {
+        incident_fingerprint(
+            record.get("detection_type"), record.get("source_ip"),
+            record.get("destination_ip"), record.get("signature")
+        ): record
+        for record in restored_incidents
+    }
+incident_store = st.session_state["nids_incidents"]
 incident_records = list(incident_store.values())
 
 if not incident_records:
@@ -791,7 +838,11 @@ else:
     if st.button("Save incident updates", key=f"save_incident_{selected_id}"):
         incident_store[selected_key]["status"] = status_value
         incident_store[selected_key]["analyst_notes"] = notes_value
-        st.success("Incident record updated for this dashboard session.")
+        try:
+            nids_db.update_incident(selected_id, status_value, notes_value)
+            st.success("Incident status and analyst notes saved to SQLite.")
+        except Exception as exc:
+            st.error(f"Could not persist incident updates: {exc}")
 
     st.download_button(
         "Export incident register (JSON)",
@@ -801,8 +852,8 @@ else:
     )
 
     st.caption(
-        "Incident records are held in Streamlit session state. They persist "
-        "during this dashboard session, but are not yet stored in a database."
+        f"Persistent incident register: SQLite ({nids_db.db_path}). "
+        "Incident evidence, status changes and analyst notes are stored locally."
     )
 
 

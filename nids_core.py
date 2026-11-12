@@ -5,6 +5,12 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
+try:
+    from storage import NIDSStorage
+    _NIDS_STORAGE = NIDSStorage()
+except Exception:
+    _NIDS_STORAGE = None
+
 DEMO_EVENTS = [
  {"timestamp":"2026-10-28T18:00:01+0000","event_type":"alert","src_ip":"192.168.56.10","src_port":51120,"dest_ip":"192.168.56.20","dest_port":22,"proto":"TCP","alert":{"signature":"ET SCAN Potential SSH Scan","category":"Attempted Information Leak","severity":2,"signature_id":2001219}},
  {"timestamp":"2026-10-28T18:01:14+0000","event_type":"alert","src_ip":"192.168.56.10","src_port":51201,"dest_ip":"192.168.56.20","dest_port":80,"proto":"TCP","alert":{"signature":"ET SCAN Nmap Scripting Engine User-Agent Detected","category":"Attempted Information Leak","severity":2,"signature_id":2024364}},
@@ -154,20 +160,43 @@ def llm_triage(event):
 
 
 def enrich_alert(event, cache=None):
-    """Return enriched alert; cache successful Gemini results per process."""
+    """Use persistent Gemini cache and quota controls; always retain local fallback."""
     key = _event_cache_key(event)
-    triage = _GEMINI_CACHE.get(key)
+    triage = cache.get(key) if isinstance(cache, dict) else None
+    if triage is None:
+        triage = _GEMINI_CACHE.get(key)
+    if triage is None and _NIDS_STORAGE is not None:
+        try:
+            triage = _NIDS_STORAGE.get_ai_result(key)
+        except Exception:
+            triage = None
 
     if triage is None:
-        triage = llm_triage(event)
-        if triage is not None:
-            if len(_GEMINI_CACHE) >= _GEMINI_CACHE_MAX:
-                # Dict insertion order is deterministic on supported Python versions.
-                _GEMINI_CACHE.pop(next(iter(_GEMINI_CACHE)))
-            _GEMINI_CACHE[key] = triage
+        try:
+            allowed, reason, daily_count = _NIDS_STORAGE.reserve_ai_request(
+                daily_limit=400, per_minute_limit=10
+            ) if _NIDS_STORAGE is not None else (False, "database_unavailable", 0)
+        except Exception:
+            allowed = False
+        if allowed:
+            triage = llm_triage(event)
+            if triage is not None:
+                try:
+                    _NIDS_STORAGE.save_ai_result(
+                        key, triage, os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+                    )
+                except Exception:
+                    pass
 
     if triage is None:
         triage = local_triage(event)
+
+    if triage.get("provider") == "gemini-api":
+        if len(_GEMINI_CACHE) >= _GEMINI_CACHE_MAX:
+            _GEMINI_CACHE.pop(next(iter(_GEMINI_CACHE)))
+        _GEMINI_CACHE[key] = triage
+        if isinstance(cache, dict):
+            cache[key] = triage
 
     return {
         "timestamp": event.get("timestamp"),

@@ -56,6 +56,11 @@ class NIDSStorage:
             CREATE TABLE IF NOT EXISTS ai_usage(
               usage_date TEXT PRIMARY KEY,request_count INTEGER DEFAULT 0,
               updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+            CREATE TABLE IF NOT EXISTS ai_request_log(
+              request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              requested_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_request_time ON ai_request_log(requested_at);
             """)
 
     def save_event(self,event):
@@ -149,6 +154,30 @@ class NIDSStorage:
         with self.connect() as c:
             row=c.execute("SELECT request_count FROM ai_usage WHERE usage_date=?",(date,)).fetchone()
         return int(row[0]) if row else 0
+
+    def reserve_ai_request(self, daily_limit=498, per_minute_limit=14):
+        """Atomically reserve an API request slot; returns (allowed, reason, daily_count)."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        day = now.date().isoformat()
+        cutoff = (now - timedelta(seconds=60)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        prune_before = (now - timedelta(days=2)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        with self.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("DELETE FROM ai_request_log WHERE requested_at < ?", (prune_before,))
+            row = c.execute("SELECT request_count FROM ai_usage WHERE usage_date=?", (day,)).fetchone()
+            daily_count = int(row[0]) if row else 0
+            minute_count = c.execute("SELECT COUNT(*) FROM ai_request_log WHERE requested_at >= ?", (cutoff,)).fetchone()[0]
+            if daily_count >= int(daily_limit):
+                return False, "daily_limit", daily_count
+            if minute_count >= int(per_minute_limit):
+                return False, "per_minute_limit", daily_count
+            c.execute("""INSERT INTO ai_usage(usage_date,request_count) VALUES(?,1)
+                         ON CONFLICT(usage_date) DO UPDATE SET request_count=request_count+1,
+                         updated_at=CURRENT_TIMESTAMP""", (day,))
+            c.execute("INSERT INTO ai_request_log(requested_at) VALUES(?)", (now_iso,))
+            return True, "allowed", daily_count + 1
 
     def backup(self,destination=None):
         target=Path(destination) if destination else self.db_path.with_suffix(".backup.db")
