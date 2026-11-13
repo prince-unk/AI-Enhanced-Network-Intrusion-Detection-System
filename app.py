@@ -160,6 +160,109 @@ def read_new_eve_events(path, buffer_limit=DISPLAY_EVENT_LIMIT, alert_limit=200)
 
     return state.live_events, state.live_alerts
 
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+    :root {
+        --nids-bg: #101923;
+        --nids-surface: #1B2836;
+        --nids-elevated: #29394B;
+        --nids-muted: #60758B;
+        --nids-text: #CBD5E1;
+        --nids-bright: #F1F5F9;
+        --nids-border: rgba(148, 163, 184, 0.16);
+        --nids-accent: #8FA6BC;
+    }
+
+    html, body, [class*="stApp"] {
+        font-family: 'Inter', 'Segoe UI', Roboto, sans-serif;
+    }
+    .stApp { background: var(--nids-bg); color: var(--nids-text); }
+    [data-testid="stHeader"] { background: rgba(16, 25, 35, 0.92); }
+    [data-testid="stToolbar"] { right: 1rem; }
+    [data-testid="stSidebar"] {
+        background: #131F2B;
+        border-right: 1px solid var(--nids-border);
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+        color: var(--nids-text);
+    }
+    h1, h2, h3, h4 {
+        color: var(--nids-bright) !important;
+        letter-spacing: -0.025em;
+        font-weight: 600 !important;
+    }
+    h1 { font-size: clamp(1.65rem, 2.2vw, 2.15rem) !important; }
+    h2 { font-size: 1.35rem !important; }
+    h3 { font-size: 1.08rem !important; }
+    p, label, .stCaption, [data-testid="stMarkdownContainer"] {
+        color: var(--nids-text);
+    }
+    [data-testid="stMetric"] {
+        background: var(--nids-surface);
+        border: 1px solid var(--nids-border);
+        border-radius: 10px;
+        padding: 14px 16px;
+    }
+    [data-testid="stMetricLabel"] { color: #9FB0C1 !important; }
+    [data-testid="stMetricValue"] {
+        color: var(--nids-bright) !important;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+    }
+    [data-testid="stDataFrame"], [data-testid="stTable"] {
+        border: 1px solid var(--nids-border);
+        border-radius: 9px;
+        overflow: hidden;
+    }
+    [data-testid="stExpander"] {
+        background: rgba(27, 40, 54, 0.58);
+        border: 1px solid var(--nids-border);
+        border-radius: 9px;
+    }
+    [data-testid="stTextInput"] input,
+    [data-testid="stTextArea"] textarea,
+    [data-testid="stSelectbox"] [data-baseweb="select"],
+    [data-testid="stMultiSelect"] [data-baseweb="select"] {
+        background: var(--nids-surface);
+        border-color: var(--nids-border);
+        border-radius: 7px;
+    }
+    .stButton > button, .stDownloadButton > button {
+        border: 1px solid rgba(143, 166, 188, 0.35);
+        border-radius: 7px;
+        background: #29394B;
+        color: var(--nids-bright);
+        font-weight: 500;
+        transition: background 120ms ease, border-color 120ms ease;
+    }
+    .stButton > button:hover, .stDownloadButton > button:hover {
+        background: #35495E;
+        border-color: #8FA6BC;
+        color: #FFFFFF;
+    }
+    [data-testid="stAlert"] { border-radius: 8px; }
+    hr { border-color: var(--nids-border) !important; }
+    code, pre, [data-testid="stCode"] {
+        font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace !important;
+        font-size: 0.88em;
+    }
+    [data-testid="stJson"] {
+        background: rgba(27, 40, 54, 0.72);
+        border: 1px solid var(--nids-border);
+        border-radius: 8px;
+        padding: 10px;
+    }
+    /* Keep status colours reserved for actual operational state. */
+    [data-testid="stStatusWidget"] { color: var(--nids-text); }
+    @media (max-width: 768px) {
+        [data-testid="stMetric"] { padding: 10px 12px; }
+        h1 { font-size: 1.55rem !important; }
+    }
+    </style>
+""", unsafe_allow_html=True)
+
 st.title(":shield: AI-Enhanced Network Intrusion Detection System")
 st.caption(
     "Suricata signature detection • Live network monitoring "
