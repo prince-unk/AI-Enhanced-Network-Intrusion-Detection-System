@@ -70,6 +70,12 @@ class NIDSStorage:
             );
             CREATE INDEX IF NOT EXISTS idx_ai_request_time ON ai_request_log(requested_at);
             """)
+            # Backfill alerts saved before alert_history was introduced.
+            c.execute("""
+                INSERT OR IGNORE INTO alert_history(alert_id, raw_json, created_at)
+                SELECT event_id, raw_json, created_at FROM events
+                WHERE lower(coalesce(event_type, '')) = 'alert'
+            """)
 
     def save_event(self,event):
         a=event.get("alert") or {}
@@ -198,6 +204,45 @@ class NIDSStorage:
                       (key, self.js(detection)))
         return key
 
+    def get_alert_history(self, limit=500):
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT raw_json FROM alert_history ORDER BY created_at DESC LIMIT ?",
+                (int(limit),)
+            ).fetchall()
+        return [json.loads(row["raw_json"]) for row in reversed(rows)]
+
+    def get_behavioral_detections(self, limit=500):
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT detection_json FROM behavioral_detections ORDER BY created_at DESC LIMIT ?",
+                (int(limit),)
+            ).fetchall()
+        return [json.loads(row["detection_json"]) for row in reversed(rows)]
+
+    def get_audit_log(self, incident_id=None, limit=500):
+        query = "SELECT * FROM audit_log"
+        params = []
+        if incident_id is not None:
+            query += " WHERE incident_id = ?"
+            params.append(str(incident_id))
+        query += " ORDER BY audit_id DESC LIMIT ?"
+        params.append(int(limit))
+        with self.connect() as c:
+            rows = c.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_incident_evidence(self, incident_id):
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT fingerprint, evidence_json FROM incident_evidence WHERE incident_id=? ORDER BY evidence_id",
+                (str(incident_id),)
+            ).fetchall()
+        return [
+            {"fingerprint": row["fingerprint"], "evidence": json.loads(row["evidence_json"])}
+            for row in rows
+        ]
+
     def apply_retention(self, routine_event_cap=20000):
         """Routine events: 7 days and 20k cap; alerts/behaviour: 30 days;
         incidents/evidence/notes/audit: 60 days."""
@@ -209,10 +254,10 @@ class NIDSStorage:
         deleted = {}
         with self.connect() as c:
             c.execute("BEGIN IMMEDIATE")
-            cur=c.execute("DELETE FROM events WHERE lower(coalesce(event_type,'')) != 'alert' AND created_at < ?",(cut7,))
+            cur=c.execute("DELETE FROM events WHERE lower(coalesce(event_type,'')) != 'alert' AND json_valid(raw_json) AND json_type(raw_json, '$.alert') IS NULL AND created_at < ?",(cut7,))
             deleted["routine_events_age"]=cur.rowcount
             cur=c.execute("""DELETE FROM events WHERE event_id IN (
-                SELECT event_id FROM events WHERE lower(coalesce(event_type,'')) != 'alert'
+                SELECT event_id FROM events WHERE lower(coalesce(event_type,'')) != 'alert' AND json_valid(raw_json) AND json_type(raw_json, '$.alert') IS NULL
                 ORDER BY rowid DESC LIMIT -1 OFFSET ?)""",(int(routine_event_cap),))
             deleted["routine_events_cap"]=cur.rowcount
             cur=c.execute("DELETE FROM alert_history WHERE created_at < ?",(cut30,))
@@ -220,7 +265,7 @@ class NIDSStorage:
             cur = c.execute(
                 """
                 DELETE FROM events
-                WHERE lower(coalesce(event_type, '')) = 'alert'
+                WHERE (lower(coalesce(event_type, '')) = 'alert' OR (json_valid(raw_json) AND json_type(raw_json, '$.alert') IS NOT NULL))
                 AND created_at < ?
                 """,
                 (cut30,)

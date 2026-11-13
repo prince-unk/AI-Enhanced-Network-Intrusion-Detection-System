@@ -173,17 +173,71 @@ class IncidentCorrelator:
             "weight": event["weight"]
         })
 
-        # Explainable score: strongest evidence + supporting events.
-        weights = [
-            item["weight"] for item in incident["evidence"]
-        ]
-
-        score = max(weights) + min(
-            40, max(0, len(weights) - 1) * 10
+        # Deterministic, explainable score. Each component is capped and
+        # derived only from fields observed in the supplied evidence.
+        weights = [item["weight"] for item in incident["evidence"]]
+        strongest = max(weights, default=10)
+        event_count = len(incident["evidence"])
+        destination_count = len(incident["destinations"])
+        behavioral_count = sum(
+            item["event_type"] == "behavioral"
+            for item in incident["evidence"]
         )
 
-        incident["risk_score"] = min(100, score)
+        factors = [
+            {
+                "name": "Detection severity",
+                "points": strongest,
+                "maximum": 40,
+                "explanation": (
+                    "Highest severity weight among the observed detections."
+                ),
+            }
+        ]
+
+        corroboration_points = min(25, max(0, event_count - 1) * 5)
+        factors.append({
+            "name": "Corroborating events",
+            "points": corroboration_points,
+            "maximum": 25,
+            "explanation": (
+                f"{event_count} distinct event(s) were correlated; repeated "
+                "supporting evidence increases priority."
+            ),
+        })
+
+        diversity_points = min(15, max(0, destination_count - 1) * 5)
+        factors.append({
+            "name": "Destination diversity",
+            "points": diversity_points,
+            "maximum": 15,
+            "explanation": (
+                f"Activity involved {destination_count} distinct destination(s)."
+            ),
+        })
+
+        behavioral_points = 10 if behavioral_count else 0
+        factors.append({
+            "name": "Behavioural evidence",
+            "points": behavioral_points,
+            "maximum": 10,
+            "explanation": (
+                f"{behavioral_count} behavioural detection(s) contributed."
+                if behavioral_count else
+                "No behavioural detection was present in this incident."
+            ),
+        })
+
+        score = min(100, sum(item["points"] for item in factors))
+        incident["risk_score"] = score
         incident["risk_level"] = self.risk_level(score)
+        incident["risk_factors"] = factors
+        incident["risk_scoring_method"] = "evidence_weighted_v1"
+        incident["risk_score_limitations"] = [
+            "Asset criticality is not included because asset inventory data is not available.",
+            "Detection confidence is not independently calibrated by this scoring model.",
+            "A correlated pattern is not proof of successful compromise."
+        ]
 
         incident["recommended_action"] = self.recommend_action(
             incident["risk_level"]

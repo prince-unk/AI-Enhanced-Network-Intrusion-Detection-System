@@ -1,4 +1,5 @@
-streamlit>=1.36,<2
-streamlit-autorefresh>=1.0.1,<2
-pandas>=2.0,<4
-google-genai>=1.0
+streamlit
+streamlit-autorefresh
+pandas
+python-dotenv
+google-genai

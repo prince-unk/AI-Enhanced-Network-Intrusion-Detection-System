@@ -9,10 +9,21 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-from nids_core import load_events, enrich_alert
+from nids_core import load_events, enrich_alert, enrich_incident
 
 from behavior_engine import BehavioralDetector
+from incident_engine import IncidentCorrelator
 from storage import NIDSStorage
+
+# Streamlit requires page configuration before any other Streamlit command.
+st.set_page_config(
+    page_title="AI-Enhanced NIDS",
+    page_icon=":shield:",
+    layout="wide"
+)
+
+# Fixed display window for this academic demonstration; retention is independent.
+DISPLAY_EVENT_LIMIT = 500
 
 # Shared local database for dashboard persistence.
 nids_db = NIDSStorage()
@@ -24,7 +35,7 @@ if not st.session_state.get("nids_retention_applied", False):
     except Exception as exc:
         st.warning(f"Database retention cleanup could not run: {exc}")
 
-def read_new_eve_events(path, buffer_limit=500, alert_limit=200):
+def read_new_eve_events(path, buffer_limit=DISPLAY_EVENT_LIMIT, alert_limit=200):
     """Read only newly appended Suricata EVE records."""
 
     state = st.session_state
@@ -128,11 +139,8 @@ def read_new_eve_events(path, buffer_limit=500, alert_limit=200):
         if event.get("event_type") == "alert" or event.get("alert")
     ])
 
-    # Display history is loaded from SQLite on every rerun. This is important:
-    # changing the slider from 500 to (for example) 1700 must fetch older saved
-    # rows, not merely enlarge the in-memory buffer that currently holds 500.
-    # Ingestion remains incremental above; this query does not reread the EVE file
-    # and does not create duplicate database records.
+    # Reload the fixed recent display window from SQLite. Ingestion remains
+    # incremental; this query does not reread the EVE file or duplicate records.
     try:
         state.live_events = nids_db.get_events(limit=buffer_limit)
     except Exception as exc:
@@ -151,16 +159,6 @@ def read_new_eve_events(path, buffer_limit=500, alert_limit=200):
     state.live_alerts = state.live_alerts[-alert_limit:]
 
     return state.live_events, state.live_alerts
-
-# --------------------------------------------------
-# PAGE CONFIGURATION
-# --------------------------------------------------
-
-st.set_page_config(
-    page_title="AI-Enhanced NIDS",
-    page_icon=":shield:",
-    layout="wide"
-)
 
 st.title(":shield: AI-Enhanced Network Intrusion Detection System")
 st.caption(
@@ -192,13 +190,7 @@ with st.sidebar:
         else None
     )
 
-    max_events = st.slider(
-        "Recent events to display",
-        min_value=100,
-        max_value=10000,
-        value=500,
-        step=100
-    )
+    max_events = DISPLAY_EVENT_LIMIT
 
     refresh = st.checkbox(
         "Auto-refresh dashboard",
@@ -602,6 +594,64 @@ else:
         st.markdown("**Triage rationale**")
         st.write(triage.get("reason", "—"))
 
+        st.markdown("**Threat context**")
+        st.write(triage.get("threat_context", "Not available."))
+
+        st.markdown("**Potential impact**")
+        st.write(triage.get("potential_impact", "Not assessed."))
+
+        st.markdown("**Investigation playbook**")
+        investigation_steps = triage.get("investigation_steps", [])
+        if investigation_steps:
+            for step_no, step in enumerate(investigation_steps, start=1):
+                st.write(f"{step_no}. {step}")
+        else:
+            st.write("No investigation steps returned.")
+
+        st.markdown("**Response recommendations**")
+        response_recommendations = triage.get("response_recommendations", [])
+        if response_recommendations:
+            for recommendation in response_recommendations:
+                st.write(f"• {recommendation}")
+        else:
+            st.write(triage.get("recommended_action", "—"))
+
+        st.markdown("**False-positive considerations**")
+        false_positives = triage.get("false_positive_considerations", [])
+        if false_positives:
+            for consideration in false_positives:
+                st.write(f"• {consideration}")
+        else:
+            st.write("Not assessed.")
+
+        st.markdown("**MITRE ATT&CK mapping (suggested)**")
+        mitre_items = triage.get("mitre_attack", [])
+        if mitre_items:
+            for technique in mitre_items:
+                st.write(
+                    f"{technique.get('technique_id', '')} — "
+                    f"{technique.get('technique', '')} "
+                    f"({technique.get('tactic', 'Tactic not specified')})"
+                )
+                if technique.get("rationale"):
+                    st.caption(technique["rationale"])
+        else:
+            st.write("No technique mapping is sufficiently supported by the available evidence.")
+
+        st.markdown("**Analysis confidence**")
+        st.write(
+            f"{triage.get('confidence', 'LOW')} — "
+            f"{triage.get('confidence_reason', 'Confidence not provided.') }"
+        )
+
+        with st.expander("Evidence used and analysis limitations"):
+            st.markdown("**Evidence considered**")
+            for evidence in triage.get("evidence_used", []):
+                st.write(f"• {evidence}")
+            st.markdown("**Limitations**")
+            for limitation in triage.get("limitations", []):
+                st.write(f"• {limitation}")
+
         st.caption(
             "Triage provider: " +
             str(triage.get("provider", "unknown"))
@@ -653,7 +703,9 @@ def incident_fingerprint(kind, source_ip, destination_ip, signature):
 
 def upsert_incident(kind, severity, source_ip, destination_ip,
                     signature, timestamp, description, evidence,
-                    recommended_action):
+                    recommended_action, observed_event_count=None,
+                    risk_score_override=None, risk_factors=None,
+                    risk_scoring_method=None, risk_score_limitations=None):
     """Create or update a deduplicated incident in this dashboard session."""
     if "nids_incidents" not in st.session_state:
         restored_incidents = nids_db.get_incidents()
@@ -671,7 +723,11 @@ def upsert_incident(kind, severity, source_ip, destination_ip,
 
     severity = str(severity).upper()
     risk_by_severity = {"CRITICAL": 95, "HIGH": 80, "MEDIUM": 55, "LOW": 25}
-    risk_score = risk_by_severity.get(severity, 25)
+    risk_score = (
+        max(0, min(100, int(risk_score_override)))
+        if risk_score_override is not None
+        else risk_by_severity.get(severity, 25)
+    )
 
     if fingerprint not in incidents:
         incidents[fingerprint] = {
@@ -689,7 +745,10 @@ def upsert_incident(kind, severity, source_ip, destination_ip,
             "recommended_action": recommended_action or "Review the evidence.",
             "evidence": [],
             "status": "Open",
-            "analyst_notes": ""
+            "analyst_notes": "",
+            "risk_factors": [],
+            "risk_scoring_method": None,
+            "risk_score_limitations": []
         }
 
     incident = incidents[fingerprint]
@@ -697,7 +756,16 @@ def upsert_incident(kind, severity, source_ip, destination_ip,
     if is_new_evidence or incident["event_count"] == 0:
         incident["event_count"] += 1
     incident["last_seen"] = timestamp or datetime.now().astimezone().isoformat()
-    incident["risk_score"] = max(incident["risk_score"], risk_score)
+    incident["risk_score"] = (
+        risk_score if risk_score_override is not None
+        else max(incident["risk_score"], risk_score)
+    )
+    if risk_factors is not None:
+        incident["risk_factors"] = risk_factors
+    if risk_scoring_method is not None:
+        incident["risk_scoring_method"] = risk_scoring_method
+    if risk_score_limitations is not None:
+        incident["risk_score_limitations"] = risk_score_limitations
     if severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
         order = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
         if order.get(severity, 0) > order.get(incident["severity"], 0):
@@ -706,6 +774,8 @@ def upsert_incident(kind, severity, source_ip, destination_ip,
     if evidence and evidence not in incident["evidence"]:
         incident["evidence"].append(evidence)
         incident["evidence"] = incident["evidence"][-20:]
+    if observed_event_count is not None:
+        incident["event_count"] = max(incident["event_count"], int(observed_event_count))
 
     # Persist incident and evidence on every upsert.
     incident["fingerprint"] = fingerprint
@@ -715,43 +785,41 @@ def upsert_incident(kind, severity, source_ip, destination_ip,
         st.warning(f"SQLite incident persistence unavailable: {exc}")
 
 
-# Convert behavioural detections into incidents.
-for detection in behavior_alerts:
-    upsert_incident(
-        kind=detection.get("detection_type", "BEHAVIOURAL_DETECTION"),
-        severity=detection.get("severity", "MEDIUM"),
-        source_ip=detection.get("source_ip"),
-        destination_ip=detection.get("destination_ip"),
-        signature=detection.get("detection_type", "Behavioural detection"),
-        timestamp=detection.get("first_seen"),
-        description=detection.get("description"),
-        evidence=(
-            f"{detection.get('unique_destination_ports', '—')} unique "
-            f"destination ports in {detection.get('window_seconds', '—')} seconds"
-        ),
-        recommended_action=detection.get("recommended_action")
-    )
+# Correlate Suricata and behavioural detections before placing them in the
+# existing persistent incident register. The correlator is session-scoped so
+# Streamlit reruns do not duplicate evidence. Existing incident UI/status/notes
+# remain unchanged.
+if "nids_correlator" not in st.session_state:
+    st.session_state["nids_correlator"] = IncidentCorrelator(correlation_window=300)
+correlator = st.session_state["nids_correlator"]
+correlated_incidents = correlator.ingest(alerts, behavior_alerts)
 
-# Convert Suricata alerts into incidents.
-for item in items:
-    raw = item.get("raw", {})
-    alert = item.get("alert", {})
-    triage = item.get("triage", {})
+for correlated in correlated_incidents:
+    risk_level = correlated.get("risk_level", "LOW")
+    severity = "CRITICAL" if risk_level == "CRITICAL" else risk_level
+    destinations = correlated.get("destinations") or ["Unknown"]
+    destination_text = ", ".join(str(value) for value in destinations[:8])
+    evidence_text = json.dumps(correlated.get("evidence", [])[-20:], ensure_ascii=False)
     upsert_incident(
-        kind="SURICATA_ALERT",
-        severity=triage.get("severity", "LOW"),
-        source_ip=raw.get("src_ip"),
-        destination_ip=raw.get("dest_ip"),
-        signature=alert.get("signature", "Unknown Suricata alert"),
-        timestamp=item.get("timestamp"),
-        description=triage.get("summary", alert.get("signature", "Suricata alert")),
-        evidence=(
-            f"{item.get('timestamp', '—')} | "
-            f"SID={alert.get('signature_id', '—')}; "
-            f"Suricata severity={alert.get('severity', '—')}; "
-            f"protocol={raw.get('proto', '—')}"
+        kind="CORRELATED_ACTIVITY",
+        severity=severity,
+        source_ip=correlated.get("source_ip"),
+        destination_ip=destination_text,
+        signature=f"Correlated activity {correlated.get('incident_id', '')}",
+        timestamp=correlated.get("last_seen"),
+        description=(
+            f"Correlated {correlated.get('event_count', 0)} detection(s) from "
+            f"{correlated.get('source_ip', 'unknown source')} across "
+            f"{len(destinations)} destination(s) within the configured "
+            f"{correlator.correlation_window}-second correlation window."
         ),
-        recommended_action=triage.get("recommended_action")
+        evidence=evidence_text,
+        recommended_action=correlated.get("recommended_action"),
+        observed_event_count=correlated.get("event_count", 0),
+        risk_score_override=correlated.get("risk_score"),
+        risk_factors=correlated.get("risk_factors", []),
+        risk_scoring_method=correlated.get("risk_scoring_method"),
+        risk_score_limitations=correlated.get("risk_score_limitations", [])
     )
 
 st.divider()
@@ -839,7 +907,70 @@ else:
         f"Risk score: **{selected_incident['risk_score']}/100** "
         f"— severity: **{selected_incident['severity']}**"
     )
+    factors = selected_incident.get("risk_factors") or []
+    if factors:
+        st.markdown("**Why this risk score?**")
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Factor": item.get("name", "Unknown"),
+                    "Points": item.get("points", 0),
+                    "Maximum": item.get("maximum", 0),
+                    "Reason": item.get("explanation", "")
+                } for item in factors
+            ]),
+            use_container_width=True,
+            hide_index=True
+        )
+        limitations = selected_incident.get("risk_score_limitations") or []
+        if limitations:
+            with st.expander("Risk score assumptions and limitations"):
+                for limitation in limitations:
+                    st.markdown(f"- {limitation}")
+    else:
+        st.caption(
+            "No factor breakdown is stored for this incident yet. "
+            "New correlated evidence will populate the explainable score."
+        )
     st.write("Recommended action:", selected_incident["recommended_action"])
+
+    st.subheader("AI incident investigation")
+    incident_ai_cache = st.session_state.setdefault("nids_incident_ai_cache", {})
+    refresh_incident_ai = st.button("Re-run AI incident analysis", key=f"refresh_incident_ai_{selected_id}")
+    with st.spinner("Preparing evidence-based incident analysis..."):
+        incident_analysis = enrich_incident(
+            selected_incident, cache=incident_ai_cache, force_refresh=refresh_incident_ai
+        )
+    st.caption(
+        f"Analysis provider: {incident_analysis.get('provider', 'unknown')} • "
+        f"Confidence: {incident_analysis.get('confidence', 'LOW')}"
+    )
+    st.markdown("**Incident assessment**")
+    st.write(incident_analysis.get("summary", "No summary available."))
+    st.markdown("**Why these events matter**")
+    st.write(incident_analysis.get("reason", "No rationale available."))
+    st.markdown("**Threat context and potential impact**")
+    st.write(incident_analysis.get("threat_context", "Not assessed."))
+    st.write(incident_analysis.get("potential_impact", "Not assessed."))
+    with st.expander("Investigation playbook", expanded=True):
+        for step in incident_analysis.get("investigation_steps", []):
+            st.markdown(f"- {step}")
+    with st.expander("Response recommendations"):
+        for step in incident_analysis.get("response_recommendations", []):
+            st.markdown(f"- {step}")
+    with st.expander("False-positive considerations"):
+        for item in incident_analysis.get("false_positive_considerations", []):
+            st.markdown(f"- {item}")
+    with st.expander("MITRE ATT&CK mapping and evidence limitations"):
+        if incident_analysis.get("mitre_attack"):
+            st.json(incident_analysis["mitre_attack"])
+        else:
+            st.caption("No ATT&CK technique was mapped from the available evidence.")
+        st.write("Confidence rationale:", incident_analysis.get("confidence_reason", "Not supplied."))
+        st.write("Evidence considered:")
+        st.json(incident_analysis.get("evidence_used", []))
+        st.write("Limitations:")
+        st.json(incident_analysis.get("limitations", []))
 
     with st.expander("Incident evidence timeline", expanded=True):
         st.write("First seen:", selected_incident["first_seen"])
@@ -876,6 +1007,44 @@ else:
         json.dumps(incident_records, indent=2),
         file_name="nids_incident_register.json",
         mime="application/json"
+    )
+    st.download_button(
+        "Export incident register (CSV)",
+        incident_df.to_csv(index=False),
+        file_name="nids_incident_register.csv",
+        mime="text/csv"
+    )
+
+    report_lines = [
+        "# NIDS Executive Security Summary",
+        "",
+        f"Generated: {datetime.now().astimezone().isoformat(timespec='seconds')}",
+        f"Data source: {source}",
+        f"Events in current view: {total_events}",
+        f"Alerts in current view: {len(alerts)}",
+        f"Incidents: {len(incident_records)}",
+        f"Open: {open_count} | Investigating: {investigating_count} | Resolved: {resolved_count}",
+        "",
+        "## Highest-priority incidents",
+    ]
+    for record in sorted(incident_records, key=lambda x: x.get("risk_score", 0), reverse=True)[:10]:
+        report_lines.append(
+            f"- {record.get('incident_id')} | {record.get('severity')} | "
+            f"Risk {record.get('risk_score')}/100 | {record.get('signature')} | "
+            f"Status: {record.get('status')}"
+        )
+    report_lines.extend([
+        "",
+        "## Interpretation",
+        "This report summarises detections and triage recommendations. "
+        "A Suricata alert or AI triage result is not, by itself, proof of compromise. "
+        "Validate findings against host, authentication and network evidence.",
+    ])
+    st.download_button(
+        "Download executive summary (Markdown)",
+        "\n".join(report_lines),
+        file_name="nids_executive_summary.md",
+        mime="text/markdown"
     )
 
     st.caption(
